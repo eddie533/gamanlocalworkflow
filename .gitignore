@@ -3,6 +3,3 @@
 .DS_Store
 __pycache__/
 *.pyc
-stage1/output/
-stage2/output/
-stage2/input/
