@@ -18,6 +18,7 @@ from enrich import CompanyEnricher
 from gender import GenderGuesser
 from role_classifier import RoleClassifier
 from city_extractor import CityExtractor
+from age_finder import AgeFinder
 
 MAX_WORKERS = 50
 INPUT_DIR = Path(__file__).parent / "input"
@@ -111,6 +112,27 @@ async def extract_cities(addresses: list[str]) -> list[str]:
     return await asyncio.gather(*tasks, return_exceptions=True)
 
 
+# ── async age finding ────────────────────────────────────────────────────
+
+async def find_age_one(person: dict, semaphore: asyncio.Semaphore):
+    async with semaphore:
+        finder = AgeFinder()
+        result = await asyncio.to_thread(
+            finder.find,
+            person.get("First Name", ""),
+            person.get("Last Name", ""),
+            person.get("Company Name", ""),
+            person.get("Roles", ""),
+        )
+        return result
+
+
+async def find_ages(people: list[dict]) -> list[str]:
+    semaphore = asyncio.Semaphore(MAX_WORKERS)
+    tasks = [find_age_one(p, semaphore) for p in people]
+    return await asyncio.gather(*tasks, return_exceptions=True)
+
+
 # ── output builder ───────────────────────────────────────────────────────
 
 COMPANY_COLUMNS = [
@@ -132,6 +154,7 @@ def build_output(
     people: list[dict],
     gender_results: list[str],
     role_results: list[str],
+    age_results: list[str],
     output_path: Path,
 ):
     """Write the two-sheet output Excel."""
@@ -181,11 +204,13 @@ def build_output(
     ws_cont = wb.create_sheet("Contacts")
     ws_cont.append(CONTACT_COLUMNS)
 
-    for person, gender, role in zip(people, gender_results, role_results):
+    for person, gender, role, age in zip(people, gender_results, role_results, age_results):
         if isinstance(gender, Exception):
             gender = "Unknown"
         if isinstance(role, Exception):
             role = "Management NOT Founder/Shareholder"
+        if isinstance(age, Exception):
+            age = ""
 
         company_name = person.get("Company Name", "")
         enriched = enrich_map.get(company_name, {})
@@ -199,7 +224,7 @@ def build_output(
             person.get("LinkedIn", ""),              # LinkedIn
             gender,                                  # Gender
             role,                                    # Role
-            "",                                      # Age (placeholder)
+            age,                                     # Age
             person.get("Email", ""),                 # Email
             "",                                      # Status
         ])
@@ -263,9 +288,16 @@ def main():
         r = role if not isinstance(role, Exception) else "Management NOT Founder/Shareholder"
         print(f"  {person.get('First Name', '')} ({person.get('Roles', '')}) -> {r}")
 
+    # Find ages
+    print("\nFinding ages...")
+    age_results = asyncio.run(find_ages(people))
+    for person, age in zip(people, age_results):
+        a = age if not isinstance(age, Exception) else ""
+        print(f"  {person.get('First Name', '')} {person.get('Last Name', '')} -> {a}")
+
     # Build output
     output_path = OUTPUT_DIR / f"enriched_{input_file.stem}.xlsx"
-    build_output(enrichment_results, companies, city_results, people, gender_results, role_results, output_path)
+    build_output(enrichment_results, companies, city_results, people, gender_results, role_results, age_results, output_path)
 
     ok = sum(1 for r in enrichment_results if not isinstance(r, Exception))
     errs = len(enrichment_results) - ok
