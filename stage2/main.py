@@ -17,6 +17,7 @@ import openpyxl
 from enrich import CompanyEnricher
 from gender import GenderGuesser
 from role_classifier import RoleClassifier
+from city_extractor import CityExtractor
 
 MAX_WORKERS = 50
 INPUT_DIR = Path(__file__).parent / "input"
@@ -95,6 +96,21 @@ async def classify_all(roles: list[str]) -> list[str]:
     return await asyncio.gather(*tasks, return_exceptions=True)
 
 
+# ── async city extraction ────────────────────────────────────────────────
+
+async def extract_city_one(address: str, semaphore: asyncio.Semaphore):
+    async with semaphore:
+        extractor = CityExtractor()
+        result = await asyncio.to_thread(extractor.extract, address)
+        return result
+
+
+async def extract_cities(addresses: list[str]) -> list[str]:
+    semaphore = asyncio.Semaphore(MAX_WORKERS)
+    tasks = [extract_city_one(addr, semaphore) for addr in addresses]
+    return await asyncio.gather(*tasks, return_exceptions=True)
+
+
 # ── output builder ───────────────────────────────────────────────────────
 
 COMPANY_COLUMNS = [
@@ -111,18 +127,23 @@ CONTACT_COLUMNS = [
 
 def build_output(
     enrichment_results: list[dict],
+    raw_companies: list[dict],
+    city_results: list[str],
     people: list[dict],
     gender_results: list[str],
     role_results: list[str],
     output_path: Path,
 ):
     """Write the two-sheet output Excel."""
-    # Build a lookup: original company name → enrichment result
+    # Build lookups: original company name → enrichment result / raw input
     enrich_map: dict[str, dict] = {}
+    raw_map: dict[str, dict] = {}
     for r in enrichment_results:
         if isinstance(r, Exception):
             continue
         enrich_map[r["company_name"]] = r
+    for c in raw_companies:
+        raw_map[c.get("Company Name", "")] = c
 
     today = date.today().isoformat()
 
@@ -133,25 +154,27 @@ def build_output(
     ws_comp.title = "Companies"
     ws_comp.append(COMPANY_COLUMNS)
 
-    for r in enrichment_results:
+    for r, city in zip(enrichment_results, city_results):
         if isinstance(r, Exception):
             continue
+        raw = raw_map.get(r["company_name"], {})
+        cd = r["company_data"]
         ws_comp.append([
-            r.get("informal_name", ""),            # Company Name
-            "",                                     # Country (placeholder)
-            r["company_data"].get("Website URL", r["company_data"].get("Website", "")),
-            r.get("vertical", ""),                  # Vertical
-            r.get("subvertical", ""),               # Sub-Vertical
-            today,                                  # Date Added
-            "Eddie Childs",                         # Added By
-            r.get("company_name", ""),              # Legal name
-            "Proprietary",                          # Source
-            "Reach Out",                            # Status
-            "",                                     # Founding Year
-            "",                                     # City
-            "",                                     # LinkedIn Page
-            "",                                     # Currency
-            "",                                     # FTEs
+            r.get("informal_name", ""),                              # Company Name
+            raw.get("Country", ""),                                  # Country
+            cd.get("Website URL", cd.get("Website", "")),            # Company Website
+            r.get("vertical", ""),                                   # Vertical
+            r.get("subvertical", ""),                                # Sub-Vertical
+            today,                                                   # Date Added
+            "Eddie Childs",                                          # Added By
+            r.get("company_name", ""),                               # Legal name
+            "Proprietary",                                           # Source
+            "Reach Out",                                             # Status
+            raw.get("Founding Year", ""),                             # Founding Year
+            city if not isinstance(city, Exception) else "",          # City
+            raw.get("LinkedIn URL", ""),                              # LinkedIn Page
+            "",                                                      # Currency
+            raw.get("FTE Count", ""),                                 # FTEs
         ])
 
     # ── Contacts sheet ──
@@ -204,6 +227,7 @@ def main():
             "Company Name": c.get("Company Name", ""),
             "Website": c.get("Website URL", ""),
             "Description": c.get("Description", ""),
+            "Country": c.get("Country", ""),
         })
 
     # Enrich companies
@@ -214,6 +238,14 @@ def main():
             print(f"  error: {r}")
         else:
             print(f"  {r['company_name']} -> {r.get('informal_name')} [{r.get('vertical')}]")
+
+    # Extract cities from addresses
+    print("\nExtracting cities...")
+    addresses = [c.get("Address", "") for c in companies]
+    city_results = asyncio.run(extract_cities(addresses))
+    for c, city in zip(companies, city_results):
+        ct = city if not isinstance(city, Exception) else ""
+        print(f"  {c.get('Company Name', '')} -> {ct}")
 
     # Guess genders
     print("\nGuessing genders...")
@@ -233,7 +265,7 @@ def main():
 
     # Build output
     output_path = OUTPUT_DIR / f"enriched_{input_file.stem}.xlsx"
-    build_output(enrichment_results, people, gender_results, role_results, output_path)
+    build_output(enrichment_results, companies, city_results, people, gender_results, role_results, output_path)
 
     ok = sum(1 for r in enrichment_results if not isinstance(r, Exception))
     errs = len(enrichment_results) - ok

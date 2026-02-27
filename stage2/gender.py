@@ -51,5 +51,5 @@ Given a first name, guess the most likely gender.
             return gender
 
         except Exception as e:
-            print(f"  ⚠ Gender guess error for '{first_name}': {e}")
+            print(f"  error guessing gender for '{first_name}': {e}")
             return "Unknown"
