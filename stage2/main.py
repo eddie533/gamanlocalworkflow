@@ -20,7 +20,10 @@ from role_classifier import RoleClassifier
 from city_extractor import CityExtractor
 from age_finder import AgeFinder
 
-MAX_WORKERS = 50
+MAX_WORKERS_HEAVY = 10   # gpt-5 + web search (enrich, age)
+MAX_WORKERS_LIGHT = 30   # gpt-5-nano (gender, role, city)
+MAX_RETRIES = 5
+RETRY_BASE_DELAY = 2     # seconds, doubles each retry
 INPUT_DIR = Path(__file__).parent / "input"
 OUTPUT_DIR = Path(__file__).parent / "output"
 
@@ -52,17 +55,34 @@ def read_sheet(wb: openpyxl.Workbook, name: str) -> list[dict]:
     ]
 
 
+# ── retry helper ────────────────────────────────────────────────────────
+
+async def run_with_retry(func, *args):
+    """Run a blocking function in a thread with exponential backoff on rate-limit errors."""
+    for attempt in range(MAX_RETRIES):
+        try:
+            return await asyncio.to_thread(func, *args)
+        except Exception as e:
+            error_msg = str(e)
+            is_rate_limit = "429" in error_msg or "rate" in error_msg.lower()
+            if is_rate_limit and attempt < MAX_RETRIES - 1:
+                wait = RETRY_BASE_DELAY * (2 ** attempt)
+                print(f"  rate limited, retrying in {wait}s (attempt {attempt + 1}/{MAX_RETRIES})")
+                await asyncio.sleep(wait)
+            else:
+                raise
+
+
 # ── async enrichment ────────────────────────────────────────────────────
 
 async def enrich_one(company: dict, semaphore: asyncio.Semaphore):
     async with semaphore:
         enricher = CompanyEnricher()
-        result = await asyncio.to_thread(enricher.enrich_company, company)
-        return result
+        return await run_with_retry(enricher.enrich_company, company)
 
 
 async def enrich_all(companies: list[dict]) -> list[dict]:
-    semaphore = asyncio.Semaphore(MAX_WORKERS)
+    semaphore = asyncio.Semaphore(MAX_WORKERS_HEAVY)
     tasks = [enrich_one(c, semaphore) for c in companies]
     return await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -72,12 +92,11 @@ async def enrich_all(companies: list[dict]) -> list[dict]:
 async def guess_one(first_name: str, semaphore: asyncio.Semaphore):
     async with semaphore:
         guesser = GenderGuesser()
-        result = await asyncio.to_thread(guesser.guess, first_name)
-        return result
+        return await run_with_retry(guesser.guess, first_name)
 
 
 async def guess_all(first_names: list[str]) -> list[str]:
-    semaphore = asyncio.Semaphore(MAX_WORKERS)
+    semaphore = asyncio.Semaphore(MAX_WORKERS_LIGHT)
     tasks = [guess_one(name, semaphore) for name in first_names]
     return await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -87,12 +106,11 @@ async def guess_all(first_names: list[str]) -> list[str]:
 async def classify_one(role: str, semaphore: asyncio.Semaphore):
     async with semaphore:
         classifier = RoleClassifier()
-        result = await asyncio.to_thread(classifier.classify, role)
-        return result
+        return await run_with_retry(classifier.classify, role)
 
 
 async def classify_all(roles: list[str]) -> list[str]:
-    semaphore = asyncio.Semaphore(MAX_WORKERS)
+    semaphore = asyncio.Semaphore(MAX_WORKERS_LIGHT)
     tasks = [classify_one(role, semaphore) for role in roles]
     return await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -102,12 +120,11 @@ async def classify_all(roles: list[str]) -> list[str]:
 async def extract_city_one(address: str, semaphore: asyncio.Semaphore):
     async with semaphore:
         extractor = CityExtractor()
-        result = await asyncio.to_thread(extractor.extract, address)
-        return result
+        return await run_with_retry(extractor.extract, address)
 
 
 async def extract_cities(addresses: list[str]) -> list[str]:
-    semaphore = asyncio.Semaphore(MAX_WORKERS)
+    semaphore = asyncio.Semaphore(MAX_WORKERS_LIGHT)
     tasks = [extract_city_one(addr, semaphore) for addr in addresses]
     return await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -117,23 +134,34 @@ async def extract_cities(addresses: list[str]) -> list[str]:
 async def find_age_one(person: dict, semaphore: asyncio.Semaphore):
     async with semaphore:
         finder = AgeFinder()
-        result = await asyncio.to_thread(
+        return await run_with_retry(
             finder.find,
             person.get("First Name", ""),
             person.get("Last Name", ""),
             person.get("Company Name", ""),
             person.get("Roles", ""),
         )
-        return result
 
 
 async def find_ages(people: list[dict]) -> list[str]:
-    semaphore = asyncio.Semaphore(MAX_WORKERS)
+    semaphore = asyncio.Semaphore(MAX_WORKERS_HEAVY)
     tasks = [find_age_one(p, semaphore) for p in people]
     return await asyncio.gather(*tasks, return_exceptions=True)
 
 
 # ── output builder ───────────────────────────────────────────────────────
+
+COUNTRY_TO_CURRENCY = {
+    "United Kingdom": "GBP",
+    "Denmark": "DKK",
+    "Switzerland": "CHF",
+    "Spain": "EUR",
+    "France": "EUR",
+    "Belgium": "EUR",
+    "Luxembourg": "EUR",
+    "Netherlands": "EUR",
+    "Portugal": "EUR",
+}
 
 COMPANY_COLUMNS = [
     "Company Name", "Country", "Company Website", "Vertical", "Sub-Vertical",
@@ -196,13 +224,16 @@ def build_output(
             raw.get("Founding Year", ""),                             # Founding Year
             city if not isinstance(city, Exception) else "",          # City
             raw.get("LinkedIn URL", ""),                              # LinkedIn Page
-            "",                                                      # Currency
+            COUNTRY_TO_CURRENCY.get(raw.get("Country", ""), ""),      # Currency
             raw.get("FTE Count", ""),                                 # FTEs
         ])
 
     # ── Contacts sheet ──
     ws_cont = wb.create_sheet("Contacts")
     ws_cont.append(CONTACT_COLUMNS)
+
+    # Track which companies have at least one person
+    companies_with_people: set[str] = set()
 
     for person, gender, role, age in zip(people, gender_results, role_results, age_results):
         if isinstance(gender, Exception):
@@ -213,6 +244,7 @@ def build_output(
             age = ""
 
         company_name = person.get("Company Name", "")
+        companies_with_people.add(company_name)
         enriched = enrich_map.get(company_name, {})
         informal = enriched.get("informal_name", company_name)
 
@@ -229,6 +261,27 @@ def build_output(
             "",                                      # Status
         ])
 
+    # Add placeholder rows for companies with no people
+    for r in enrichment_results:
+        if isinstance(r, Exception):
+            continue
+        company_name = r["company_name"]
+        if company_name not in companies_with_people:
+            informal = r.get("informal_name", company_name)
+            raw = raw_map.get(company_name, {})
+            ws_cont.append([
+                informal,                                               # Company
+                "No contacts found",                                    # First Name
+                "",                                                     # Last Name
+                raw.get("Website URL", ""),                              # Company Website
+                "",                                                     # LinkedIn
+                "",                                                     # Gender
+                "",                                                     # Role
+                "",                                                     # Age
+                "",                                                     # Email
+                "",                                                     # Status
+            ])
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
     wb.save(output_path)
 
@@ -240,7 +293,7 @@ def main():
 
     wb = openpyxl.load_workbook(input_file, read_only=True)
     companies = read_sheet(wb, "Companies")
-    people = read_sheet(wb, "People")
+    people = read_sheet(wb, "People") if "People" in wb.sheetnames else []
     wb.close()
 
     print(f"Stage 2 — {len(companies)} companies, {len(people)} contacts\n")
