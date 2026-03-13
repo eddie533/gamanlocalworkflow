@@ -13,13 +13,16 @@ class CompanyEnricher:
     """Enrich companies with vertical classification and sub-vertical descriptions"""
 
     ALLOWED_VERTICALS = [
-        "Agriculture", "Construction", "CyberSecurity", "Defence",
-        "Digital Infrastructure", "Education", "Energy", "Financial Services",
-        "Food & Beverages", "Geomatics", "Healthcare", "Horizontal",
-        "Hospitality", "Information Services", "Infrastructure", "IT Services",
-        "Legal", "Logistics", "Manufacturing", "Maritime", "Media",
-        "Public Sector", "Retail", "Sustainability", "Transport Vehicles",
-        "Transportation", "Utilities", "Vertical SW", "Scientific", "Gaming", "Financial Operations Services"
+        "Agriculture", "Compliance", "Construction", "CyberSecurity", "Defence",
+        "Digital Infrastructure", "Education", "Energy", "Engineering",
+        "Financial Services", "Food & Beverages", "Gaming", "Geomatics",
+        "Healthcare", "Cross-industry", "Hospitality", "Information Services",
+        "Infrastructure", "IT Services", "Legal", "Lockers", "Logistics",
+        "Manufacturing", "Maritime", "Media", "Media Marketing",
+        "Public Sector", "Retail", "Scientific", "Sustainability",
+        "Testing & Inspection", "Transport vehicles", "Transportation",
+        "Utilities", "Specialised Industry", "Financial Operations Services",
+        "Outsourced Operations"
     ]
 
     def __init__(self, api_key: Optional[str] = None, requests_per_minute: int = 4500):
@@ -43,37 +46,52 @@ Your task is to analyze companies and:
 
 VERTICAL CLASSIFICATION RULES:
 - Choose from this EXACT list (spelling matters): {', '.join(self.ALLOWED_VERTICALS)}
-- ⚠️ Note that there is not a "Real Estate" vertical on the list
+- ⚠️ Note that there is not a "Real Estate" vertical on the list — classify Real Estate as "Construction"
+- ⚠️ Note that "Horizontal" and "Vertical SW" are NOT valid verticals. Use "Cross-industry" and "Specialised Industry" instead.
 
-**Classification Hierarchy (apply in this order):**
+**Classification Hierarchy (apply in this order — order matters!):**
 
-1. **PRIMARY: Specific Customer End-Market Vertical**
-   - If the company primarily serves ONE specific vertical category of customers → assign that vertical
+1. **Industry Vertical**
+   - First check if the company primarily serves a specific industry
+   - If most customers belong to one sector, classify under that vertical
    - Consider who BUYS the software, not what industry the company is in
    - Examples:
      • Healthcare software → "Healthcare"
      • Financial services platforms → "Financial Services"
      • Manufacturing solutions → "Manufacturing"
      • Logistics platforms → "Logistics"
-   - Note: Real Estate companies should be classified as "Construction"
+     • Construction/Real Estate → "Construction"
 
-2. **SECONDARY: Vertical SW (Niche or Multiple Verticals)**
-   - Use "Vertical SW" if:
-     • Company serves a niche vertical NOT on the allowed list
-     • Company serves TWO or more different verticals equally (no clear primary)
-     • Company is vertical-focused but doesn't fit other categories
+2. **Outsourced Operations**
+   - If the company primarily executes operational processes for clients on an ongoing basis (i.e. outsourced workflows or managed operations), classify as "Outsourced Operations"
+   - ⚠️ This must be checked BEFORE Cross-industry, otherwise many operational services will be misclassified
+   - Typical examples:
+     • Outsourced financial operations
+     • Compliance monitoring services
+     • Operational back-office services
+     • Recurring operational workflow execution for clients
 
-3. **TERTIARY: Cross-Cutting or Horizontal (Fallback)**
-   - Use specific cross-cutting verticals when applicable:
-     • "Sustainability" - ESG, carbon tracking, renewable energy management
-     • "Digital Infrastructure" - Infrastructure software (observability, monitoring, servers/VPS/networking, DevOps tools, cloud infrastructure)
-     • "CyberSecurity" - Security tools used across industries
-     • "IT Services" - IT management/service desk tools
-
-   - Use "Horizontal" as FINAL FALLBACK:
-     • Company sells to many different industries with no predominant vertical
+3. **Cross-industry**
+   - If the company provides technology or services used across many industries and is NOT primarily an outsourced operational execution provider, classify as "Cross-industry"
+   - Examples:
+     • Cybersecurity platforms (if truly cross-industry, otherwise use "CyberSecurity")
+     • Data analytics platforms
+     • Digital infrastructure monitoring tools
+     • Information services providers
      • General business software (CRM, HR, productivity, collaboration)
-     • No clear vertical focus
+
+4. **Specialised Industry**
+   - If the company operates in a narrow operational niche that does not map cleanly to an industry vertical, classify as "Specialised Industry"
+   - Examples:
+     • Smart locker platforms
+     • Laboratory workflow software
+     • Specialised inspection technologies
+
+**Simple decision rule:**
+- Serves a specific industry → assign that industry vertical
+- Executes outsourced operational workflows → "Outsourced Operations"
+- Used across many industries → "Cross-industry"
+- Niche operational domain → "Specialised Industry"
 
 SUB-VERTICAL DESCRIPTION:
 - Should complete: "I noticed [Company Name] as a leader in <subvertical>."
@@ -197,9 +215,9 @@ Classify this company and provide enrichment data.
             result = json.loads(response.output_text)
 
             # Validate vertical is in allowed list
-            vertical = result.get('vertical', 'Horizontal')
+            vertical = result.get('vertical', 'Cross-industry')
             if vertical not in self.ALLOWED_VERTICALS:
-                vertical = 'Horizontal'
+                vertical = 'Cross-industry'
 
             return {
                 "vertical": vertical,
@@ -211,8 +229,8 @@ Classify this company and provide enrichment data.
 
         except Exception as e:
             return {
-                "vertical": "Horizontal",
-                "subvertical": "software solutions",
+                "vertical": "Cross-industry",
+                "subvertical": "business solutions",
                 "informal_name": company_data.get('Informal Name', company_data.get('Company Name', 'Unknown')),
                 "error": str(e),
                 "company_name": company_data.get('Company Name', 'Unknown'),
@@ -240,7 +258,7 @@ Classify this company and provide enrichment data.
                     enrichment_results.append(result)
 
                     enriched_row = row.copy()
-                    enriched_row['Vertical'] = result.get('vertical', 'Horizontal')
+                    enriched_row['Vertical'] = result.get('vertical', 'Cross-industry')
                     enriched_row['SubVertical'] = result.get('subvertical', '')
                     enriched_row['Informal Name (Enriched)'] = result.get('informal_name', '')
                     enriched_companies.append(enriched_row)
@@ -265,7 +283,7 @@ Classify this company and provide enrichment data.
         vertical_counts = {}
         for result in results:
             if 'error' not in result:
-                vertical = result.get('vertical', 'Horizontal')
+                vertical = result.get('vertical', 'Cross-industry')
                 vertical_counts[vertical] = vertical_counts.get(vertical, 0) + 1
 
         with open(output_path, 'w', encoding='utf-8') as f:
